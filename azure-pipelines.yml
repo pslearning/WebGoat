@@ -1,0 +1,129 @@
+## Revised pipeline to Each scanning job publishes its report as a separate artifact
+## The final PublishReports job downloads all three and publishes them together.
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+
+pool:
+  name: 'Default'
+
+variables:
+  DEPENDENCY_CHECK_PATH: '$(HOME)/dependency-check'
+  LOCAL_REPORT_DIR: '$(Build.SourcesDirectory)/local_reports/all'
+  sonarHostUrl: 'http://74.224.101.235:9000'
+  sonarProjectKey: 'ProjectWebGoat'
+  sonarProjectName: 'ProjectWebGoat'
+  SONAR_TOKEN: 'sqa_70732e6bb55fce0abd879e1bc5a1b6ce5121c028'
+
+jobs:
+
+- job: SAST
+  displayName: '🔍 Static Application Security Testing (SAST)'
+  steps:
+    - script: mkdir -p $(LOCAL_REPORT_DIR)
+
+    - task: SonarQubePrepare@5
+      inputs:
+        SonarQube: 'ProjectWebGoat'
+        scannerMode: 'Other'
+        configMode: 'manual'
+        cliProjectKey: '$(sonarProjectKey)'
+        cliProjectName: '$(sonarProjectName)'
+        cliSources: '.'
+
+    - script: |
+        mvn clean verify sonar:sonar \
+        -DskipITs \
+        -Dsonar.projectKey=$(sonarProjectKey) \
+        -Dsonar.host.url=$(sonarHostUrl) \
+        -Dsonar.login=$(SONAR_TOKEN) \
+        -Dmaven.test.failure.ignore=false
+
+    - script: |
+        curl -s -u $(SONAR_TOKEN): "$(sonarHostUrl)/api/qualitygates/project_status?projectKey=$(sonarProjectKey)" \
+        | jq . > $(LOCAL_REPORT_DIR)/sonarqube_quality_gate.json
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(LOCAL_REPORT_DIR)'
+        ArtifactName: 'SASTReport'
+        publishLocation: 'Pipeline'
+
+- job: SCA
+  displayName: '📦 Software Composition Analysis (Dependency-Check)'
+  steps:
+    - script: mkdir -p $(LOCAL_REPORT_DIR)
+
+    - script: |
+        $(DEPENDENCY_CHECK_PATH)/bin/dependency-check.sh \
+          --project "$(Build.Repository.Name)-Build-$(Build.BuildId)" \
+          --scan $(Build.SourcesDirectory) \
+          --format "JSON" \
+          --out $(LOCAL_REPORT_DIR) \
+          --failOnCVSS 7.0
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(LOCAL_REPORT_DIR)'
+        ArtifactName: 'SCAReport'
+        publishLocation: 'Pipeline'
+
+- job: SecretScan
+  displayName: "🔐 Gitleaks Secret Scan"
+  steps:
+    - script: mkdir -p $(LOCAL_REPORT_DIR)
+
+    - script: |
+        gitleaks detect \
+          --source . \
+          --report-format json \
+          --report-path $(LOCAL_REPORT_DIR)/gitleaks-report.json \
+          --redact=100 \
+          --exit-code 0 \
+          --verbose
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(LOCAL_REPORT_DIR)'
+        ArtifactName: 'SecretScanReport'
+        publishLocation: 'Pipeline'
+
+- job: PublishReports
+  dependsOn:
+    - SAST
+    - SCA
+    - SecretScan
+  displayName: "📤 Publish All Scan Reports"
+  steps:
+
+    - task: DownloadPipelineArtifact@2
+      inputs:
+        artifact: 'SASTReport'
+        path: '$(Build.SourcesDirectory)/all_reports/sast'
+
+    - task: DownloadPipelineArtifact@2
+      inputs:
+        artifact: 'SCAReport'
+        path: '$(Build.SourcesDirectory)/all_reports/sca'
+
+    - task: DownloadPipelineArtifact@2
+      inputs:
+        artifact: 'SecretScanReport'
+        path: '$(Build.SourcesDirectory)/all_reports/secrets'
+
+    - script: |
+        echo "📁 Consolidating reports..."
+        mkdir -p $(Build.SourcesDirectory)/local_reports/all
+        cp -r $(Build.SourcesDirectory)/all_reports/** $(Build.SourcesDirectory)/local_reports/all || true
+        echo "📂 Listing consolidated files:"
+        ls -lR $(Build.SourcesDirectory)/local_reports/all
+      displayName: "🔎 Consolidate and List All Reports"
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.SourcesDirectory)/local_reports/all'
+        ArtifactName: 'ScanReports'
+        publishLocation: 'Container'
+      displayName: '📦 Publish Combined Reports as Artifact'
